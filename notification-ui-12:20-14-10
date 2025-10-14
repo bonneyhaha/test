@@ -1,0 +1,282 @@
+# main.py
+import sys
+import asyncio
+import threading
+import json
+import queue
+import time
+import webbrowser
+
+from PySide6.QtWidgets import (
+    QApplication, QSystemTrayIcon, QMenu, QAction, QLabel, QVBoxLayout, QDialog
+)
+from PySide6.QtGui import QIcon, QMovie, QPixmap, QColor, QPainter, QBrush
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QRect, QEasingCurve
+from PySide6.QtMultimedia import QSoundEffect
+from PySide6.QtCore import QUrl
+
+# ---------------------------
+# Configuration
+# ---------------------------
+# Replace this with your actual websocket URL
+WEBSOCKET_URL = "ws://127.0.0.1:8000/ws/notifications"
+
+# How long the popup stays (ms)
+POPUP_DURATION_MS = 4000
+
+# How long to show alert icon (ms)
+ALERT_ICON_DURATION_MS = 3500
+
+# Queue to transfer messages from websocket thread to Qt main thread
+message_queue = queue.Queue()
+
+
+# ---------------------------
+# Notification Popup (clickable)
+# ---------------------------
+class NotificationPopup(QDialog):
+    def __init__(self, title: str, message: str, url: str | None = None, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint | Qt.BypassWindowManagerHint
+        )
+        # allow clicking even when another window has focus
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(380, 140)
+
+        # layout and labels
+        layout = QVBoxLayout()
+        layout.setContentsMargins(18, 12, 18, 12)
+
+        title_label = QLabel(f"<b>{title}</b>")
+        message_label = QLabel(message)
+        message_label.setWordWrap(True)
+
+        title_label.setStyleSheet("color: white; font-family: 'Segoe UI'; font-size: 14px;")
+        message_label.setStyleSheet("color: white; font-family: 'Segoe UI'; font-size: 12px;")
+
+        layout.addWidget(title_label)
+        layout.addWidget(message_label)
+        self.setLayout(layout)
+
+        # background color with alpha (frosted look)
+        self.bg_color = QColor(25, 25, 25, 200)
+
+        # place bottom-right above taskbar (available geometry)
+        screen_geometry = QApplication.primaryScreen().availableGeometry()
+        x = screen_geometry.right() - self.width() - 22
+        y = screen_geometry.bottom() - self.height() - 22
+        self.move(x, y)
+
+        # slide + fade animations
+        self.anim = QPropertyAnimation(self, b"geometry")
+        self.anim.setDuration(520)
+        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+        start_rect = QRect(x, y + 60, self.width(), self.height())
+        end_rect = QRect(x, y, self.width(), self.height())
+        self.anim.setStartValue(start_rect)
+        self.anim.setEndValue(end_rect)
+        self.anim.start()
+
+        self.setWindowOpacity(0.0)
+        self.fade = QPropertyAnimation(self, b"windowOpacity")
+        self.fade.setDuration(520)
+        self.fade.setStartValue(0.0)
+        self.fade.setEndValue(1.0)
+        self.fade.start()
+
+        # auto-close
+        QTimer.singleShot(POPUP_DURATION_MS, self._fade_out)
+
+    def paintEvent(self, event):
+        # rounded translucent background
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        brush = QBrush(self.bg_color)
+        painter.setBrush(brush)
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(self.rect(), 14, 14)
+
+    def _fade_out(self):
+        f = QPropertyAnimation(self, b"windowOpacity")
+        f.setDuration(420)
+        f.setStartValue(1.0)
+        f.setEndValue(0.0)
+        f.finished.connect(self.close)
+        f.start()
+
+    def mousePressEvent(self, event):
+        # open the URL if provided
+        if self.url:
+            try:
+                webbrowser.open(self.url)
+            except Exception as e:
+                print("Failed to open URL:", e)
+        # close immediately on click
+        self.close()
+        super().mousePressEvent(event)
+
+
+# ---------------------------
+# Main Tray Application
+# ---------------------------
+class BirdTrayApp:
+    def __init__(self):
+        # Qt Application
+        self.app = QApplication(sys.argv)
+
+        # System tray icon
+        self.tray_icon = QSystemTrayIcon()
+        self.tray_menu = QMenu()
+        self.exit_action = QAction("Exit")
+        self.exit_action.triggered.connect(self._on_exit)
+        self.tray_menu.addAction(self.exit_action)
+
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.setToolTip("BirdNotifier Deluxe 🐦")
+
+        # Animated GIF as tray icon
+        self.movie = QMovie("assets/bird_flap.gif")
+        if not self.movie.isValid():
+            # fallback to static icon if GIF not found
+            self.tray_icon.setIcon(QIcon("assets/bird_idle.png"))
+        else:
+            # start reading frames and apply them to tray icon
+            self.movie.frameChanged.connect(self._update_tray_from_movie)
+            # loop forever
+            self.movie.setCacheMode(QMovie.CacheAll)
+            self.movie.start()
+
+        self.tray_icon.show()
+
+        # Sound effect
+        self.sound = QSoundEffect()
+        self.sound.setSource(QUrl.fromLocalFile("assets/chirp.wav"))
+        # some systems require volume set
+        try:
+            self.sound.setVolume(0.9)
+        except Exception:
+            pass
+
+        # A timer to poll messages from the asyncio websocket thread
+        self.poll_timer = QTimer()
+        self.poll_timer.setInterval(250)  # poll every 250ms
+        self.poll_timer.timeout.connect(self._poll_queue)
+        self.poll_timer.start()
+
+        # Keep a small alert flag so we can change icon on notification
+        self.alert_timer = None
+
+        # Start the websocket listener thread (async)
+        self.ws_thread = threading.Thread(target=self._start_async_thread, daemon=True)
+        self.ws_thread.start()
+
+    def _update_tray_from_movie(self):
+        """Called in main Qt thread whenever GIF frame changes"""
+        pixmap = self.movie.currentPixmap()
+        if not pixmap.isNull():
+            self.tray_icon.setIcon(QIcon(pixmap))
+
+    def _set_alert_icon_temporarily(self):
+        """Switch to alert icon (static) for a moment, then revert to animated"""
+        try:
+            self.tray_icon.setIcon(QIcon("assets/bird_alert.png"))
+        except Exception:
+            # if alert not found, keep movie
+            pass
+        # revert after ALERT_ICON_DURATION_MS
+        if self.alert_timer:
+            self.alert_timer.stop()
+        self.alert_timer = QTimer()
+        self.alert_timer.setSingleShot(True)
+        self.alert_timer.timeout.connect(self._restore_tray_icon_from_movie)
+        self.alert_timer.start(ALERT_ICON_DURATION_MS)
+
+    def _restore_tray_icon_from_movie(self):
+        # restore the current frame of the movie (or static idle)
+        if self.movie and self.movie.isValid():
+            pixmap = self.movie.currentPixmap()
+            if not pixmap.isNull():
+                self.tray_icon.setIcon(QIcon(pixmap))
+        else:
+            try:
+                self.tray_icon.setIcon(QIcon("assets/bird_idle.png"))
+            except Exception:
+                pass
+
+    def _poll_queue(self):
+        """Periodically called in Qt main loop to handle incoming messages."""
+        try:
+            while True:
+                item = message_queue.get_nowait()
+                # item expected to be a dict with title, message, url
+                title = item.get("title", "Notification")
+                message = item.get("message", "")
+                url = item.get("url", None)
+                # show popup & sound
+                self._on_new_notification(title, message, url)
+        except queue.Empty:
+            pass
+
+    def _on_new_notification(self, title: str, message: str, url: str | None):
+        # play sound
+        try:
+            self.sound.play()
+        except Exception:
+            pass
+
+        # temporary alert icon
+        self._set_alert_icon_temporarily()
+
+        # show popup (Qt will manage lifetime)
+        popup = NotificationPopup(title, message, url)
+        popup.show()
+
+    def _on_exit(self):
+        # graceful exit
+        QApplication.quit()
+
+    # ---------------------------
+    # WebSocket (async) thread
+    # ---------------------------
+    def _start_async_thread(self):
+        # runs in a dedicated thread
+        asyncio.run(self._ws_loop())
+
+    async def _ws_loop(self):
+        import websockets  # local import to avoid blocking startup if library missing
+        while True:
+            try:
+                async with websockets.connect(WEBSOCKET_URL) as ws:
+                    print("Connected to websocket", WEBSOCKET_URL)
+                    # Optionally send auth or subscription message here
+                    while True:
+                        msg = await ws.recv()
+                        try:
+                            data = json.loads(msg)
+                        except Exception:
+                            # If backend sends plain text, wrap it
+                            data = {"title": "New message", "message": str(msg), "url": None}
+                        # Expected fields: title, message, url
+                        # Put it into queue for main GUI thread to handle
+                        message_queue.put(data)
+            except Exception as e:
+                # connection failed / closed — retry after backoff
+                print("WebSocket error / disconnected:", e)
+                # Insert a small local simulated message on disconnect for testing (optional)
+                # message_queue.put({"title": "Disconnected", "message": "Attempting reconnect...", "url": None})
+                await asyncio.sleep(3)  # backoff before reconnect
+
+
+    def run(self):
+        # start the Qt event loop (blocks)
+        sys.exit(self.app.exec())
+
+
+# ---------------------------
+# Entrypoint
+# ---------------------------
+if __name__ == "__main__":
+    app = BirdTrayApp()
+    app.run()
