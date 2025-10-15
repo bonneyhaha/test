@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef } from ‘react’;
+import birdGif from ‘./assets/bird.gif’;
+import notificationSound from ‘./assets/notification.mp3’;
 
 const NotificationApp = () => {
 const [notifications, setNotifications] = useState([]);
@@ -94,7 +96,7 @@ window.open(url, ‘_blank’);
 
 return (
 <div style={styles.container}>
-<audio ref={audioRef} src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYJGGS56+mjUBELTKXh8bllHgs=" />
+<audio ref={audioRef} src={notificationSound} />
 
 ```
   {/* Connection Status */}
@@ -149,7 +151,7 @@ return (
     {/* Bird Animation */}
     <div style={styles.birdContainer}>
       <img
-        src="https://i.giphy.com/media/v1.Y2lkPTc5MGI3NjExcTZvb3ZsMnI3aDRjZHVrYXVrYzNvNXJ3YjN6Ym1qZm1xY3NxYnN6ZyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/3oEduSBFXK3mYSVqRq/giphy.gif"
+        src={birdGif}
         alt="Bird"
         style={styles.birdImage}
       />
