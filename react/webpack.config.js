@@ -19,6 +19,13 @@ options: {
 presets: [’@babel/preset-react’]
 }
 }
+},
+{
+test: /.(png|jpg|jpeg|gif|mp3|wav|ogg)$/,
+type: ‘asset/resource’,
+generator: {
+filename: ‘assets/[name][ext]’
+}
 }
 ]
 },
