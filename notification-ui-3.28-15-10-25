@@ -1,0 +1,244 @@
+import sys
+import json
+import os
+import webbrowser
+from pathlib import Path
+
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QPoint
+from PyQt6.QtGui import QMovie, QFont
+from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
+from PyQt6.QtWebSockets import QWebSocket
+
+# Optional sound
+try:
+    from PyQt6.QtMultimedia import QSoundEffect
+    HAS_QSOUNDEFFECT = True
+except Exception:
+    HAS_QSOUNDEFFECT = False
+
+try:
+    from playsound import playsound
+    HAS_PLAYSOUND = True
+except Exception:
+    HAS_PLAYSOUND = False
+
+# === CONFIG ===
+ASSETS = Path(__file__).parent / "assets"
+BIRD_GIF = str(ASSETS / "bird.gif")
+NOTIFY_WAV = str(ASSETS / "notify.wav")
+
+EMPLOYEE_ID = "EMP123"  # change as needed
+WS_URL = f"ws://107.111.157.29:8080/ws/{EMPLOYEE_ID}"
+POPUP_DURATION_MS = 5000
+POPUP_WIDTH = 380
+POPUP_HEIGHT = 100
+BIRD_SIZE = 120
+# ==============
+
+class NotificationPopup(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(None)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.url = None  # link to open when clicked
+
+        self.opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
+
+        # Layout and style
+        self.container = QWidget(self)
+        self.container.setObjectName("container")
+        self.container.setStyleSheet("""
+            QWidget#container {
+                border-radius: 12px;
+                background-color: rgba(40, 40, 40, 220);
+            }
+        """)
+        self.layout = QVBoxLayout(self.container)
+        self.layout.setContentsMargins(14, 12, 14, 12)
+        self.title_label = QLabel("")
+        self.title_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.title_label.setStyleSheet("color: white;")
+        self.desc_label = QLabel("")
+        self.desc_label.setFont(QFont("Segoe UI", 9))
+        self.desc_label.setStyleSheet("color: rgba(255,255,255,0.9);")
+        self.desc_label.setWordWrap(True)
+        self.layout.addWidget(self.title_label)
+        self.layout.addWidget(self.desc_label)
+
+        self.resize(POPUP_WIDTH, POPUP_HEIGHT)
+        self.container.resize(self.size())
+
+    def paintEvent(self, event):
+        self.container.setGeometry(0, 0, self.width(), self.height())
+        super().paintEvent(event)
+
+    def mousePressEvent(self, event):
+        if self.url:
+            webbrowser.open(self.url)
+            self.hide()
+
+    def show_notification(self, title, description, target_pos, url=None):
+        self.url = url
+        self.title_label.setText(title)
+        self.desc_label.setText(description)
+        self.adjustSize()
+        w = max(self.width(), POPUP_WIDTH)
+        h = max(self.height(), POPUP_HEIGHT)
+        self.resize(w, h)
+        screen = QApplication.primaryScreen().availableGeometry()
+        y = max(10, min(target_pos.y(), screen.height() - h - 10))
+        final_x = target_pos.x()
+        final_y = y
+        start_x = final_x + 30
+        self.move(start_x, final_y)
+        self.setWindowOpacity(0.0)
+        self.show()
+
+        # slide animation
+        pos_anim = QPropertyAnimation(self, b"pos", self)
+        pos_anim.setStartValue(QtCore.QPoint(start_x, final_y))
+        pos_anim.setEndValue(QtCore.QPoint(final_x, final_y))
+        pos_anim.setDuration(350)
+        pos_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        pos_anim.start()
+        self._pos_anim = pos_anim
+
+        # fade in
+        self.opacity_anim.stop()
+        self.opacity_anim.setDuration(350)
+        self.opacity_anim.setStartValue(0.0)
+        self.opacity_anim.setEndValue(1.0)
+        self.opacity_anim.start()
+
+        QtCore.QTimer.singleShot(POPUP_DURATION_MS, self.fade_out)
+
+    def fade_out(self):
+        self.opacity_anim.stop()
+        self.opacity_anim.setDuration(450)
+        self.opacity_anim.setStartValue(self.windowOpacity())
+        self.opacity_anim.setEndValue(0.0)
+        self.opacity_anim.start()
+        self.opacity_anim.finished.connect(self.hide)
+
+class BirdWidget(QWidget):
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self.movie_label = QLabel(self)
+        if os.path.exists(BIRD_GIF):
+            self.movie = QMovie(BIRD_GIF)
+            self.movie.setScaledSize(QtCore.QSize(BIRD_SIZE, BIRD_SIZE))
+            self.movie_label.setMovie(self.movie)
+            self.movie.start()
+        else:
+            self.movie_label.setText("🐦")
+            self.movie_label.setFont(QFont("Segoe UI Emoji", 36))
+        self.resize(BIRD_SIZE, BIRD_SIZE)
+        self.movie_label.setGeometry(0, 0, BIRD_SIZE, BIRD_SIZE)
+
+    def animate_bird(self):
+        geom = self.geometry()
+        start = geom.topLeft()
+        offset = 12
+        anim = QPropertyAnimation(self, b"pos")
+        anim.setStartValue(start)
+        anim.setKeyValueAt(0.5, start - QPoint(offset, 0))
+        anim.setEndValue(start)
+        anim.setDuration(400)
+        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.start()
+        self._last_anim = anim
+
+class TrayNotifierApp(QtWidgets.QApplication):
+    def __init__(self, argv):
+        super().__init__(argv)
+        self.bird = BirdWidget()
+        self.popup = NotificationPopup()
+        self._place_bird_at_edge()
+
+        # websocket
+        self.ws = QWebSocket()
+        self.ws.errorOccurred.connect(self.on_ws_error)
+        self.ws.connected.connect(self.on_ws_connected)
+        self.ws.disconnected.connect(self.on_ws_disconnected)
+        self.ws.textMessageReceived.connect(self.on_ws_message)
+        self.connect_ws()
+
+        # sound
+        self.sound = None
+        if HAS_QSOUNDEFFECT and os.path.exists(NOTIFY_WAV):
+            try:
+                self.sound = QSoundEffect()
+                self.sound.setSource(QtCore.QUrl.fromLocalFile(NOTIFY_WAV))
+                self.sound.setVolume(0.9)
+            except Exception:
+                self.sound = None
+
+    def _place_bird_at_edge(self):
+        screen = self.primaryScreen().availableGeometry()
+        x = screen.right() - self.bird.width() - 8
+        y = int(screen.center().y() - self.bird.height() / 2)
+        self.bird.move(x, y)
+        self.bird.show()
+
+    def connect_ws(self):
+        try:
+            self.ws.open(QtCore.QUrl(WS_URL))
+        except Exception as e:
+            print("WS open failed:", e)
+
+    def on_ws_connected(self):
+        print("✅ WebSocket connected:", WS_URL)
+
+    def on_ws_disconnected(self):
+        print("🔄 WebSocket disconnected, retrying...")
+        QtCore.QTimer.singleShot(3000, self.connect_ws)
+
+    def on_ws_error(self, error):
+        print("⚠️ WebSocket error:", error)
+        QtCore.QTimer.singleShot(3000, self.connect_ws)
+
+    def on_ws_message(self, message):
+        title = "Notification"
+        desc = message
+        url = None
+        try:
+            obj = json.loads(message)
+            if isinstance(obj, dict):
+                title = obj.get("title", title)
+                desc = obj.get("description", obj.get("body", desc))
+                url = obj.get("url", None)
+        except Exception:
+            pass
+
+        self.play_sound()
+        self.bird.animate_bird()
+
+        bird_geo = self.bird.geometry()
+        popup_x = bird_geo.left() - POPUP_WIDTH - 12
+        popup_y = bird_geo.top() + (bird_geo.height() - POPUP_HEIGHT) // 2
+        target = QPoint(max(6, popup_x), popup_y)
+        self.popup.show_notification(title, desc, target, url)
+
+    def play_sound(self):
+        if self.sound:
+            self.sound.play()
+        elif HAS_PLAYSOUND and os.path.exists(NOTIFY_WAV):
+            QtCore.QTimer.singleShot(0, lambda: playsound(NOTIFY_WAV, block=False))
+
+def ensure_assets():
+    missing = []
+    if not os.path.exists(BIRD_GIF):
+        missing.append(BIRD_GIF)
+    if not os.path.exists(NOTIFY_WAV):
+        missing.append(NOTIFY_WAV)
+    if missing:
+        print("Warning: Missing assets ->", missing)
+
+if __name__ == "__main__":
+    ensure_assets()
+    app = TrayNotifierApp(sys.argv)
+    sys.exit(app.exec())
